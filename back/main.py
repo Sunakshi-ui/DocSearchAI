@@ -1,90 +1,118 @@
-from uuid import uuid4
+import networkx as nx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+app = FastAPI()
 
-from .ingestion import extract_pdf_chunks
-
-app = FastAPI(title="DocSearch AI")
-
-# Temporary in-memory storage for the first version.
-# It will be replaced by SQLite or Supabase later.
-DOCUMENTS: dict[str, dict] = {}
-CHUNKS: list[dict] = []
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)) -> dict:
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is missing",
+class CourseLoad(BaseModel):
+    batch: str
+    course: str
+    prof: str
+    credit: int
+
+
+class TimetableRequest(BaseModel):
+    course_loads: list[CourseLoad]
+    days: list[str]
+    slots: list[str]
+    rooms_available: int
+
+
+def build_conflict_graph(sessions: list[dict]) -> nx.Graph:
+    G = nx.Graph()
+
+    for sess in sessions:
+        G.add_node(
+            sess["id"],
+            batch=sess["batch"],
+            course=sess["course"],
+            prof=sess["prof"],
         )
 
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported",
-        )
+    node_list = list(G.nodes(data=True))
+    for i in range(len(node_list)):
+        for j in range(i + 1, len(node_list)):
+            n1, d1 = node_list[i]
+            n2, d2 = node_list[j]
 
-    pdf_bytes = await file.read()
+            # Conflict if same batch or same professor
+            if d1["batch"] == d2["batch"] or d1["prof"] == d2["prof"]:
+                G.add_edge(n1, n2)
 
-    if not pdf_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is empty",
-        )
+    return G
 
-    # Keep this limit small during development.
-    max_size = 10 * 1024 * 1024
 
-    if len(pdf_bytes) > max_size:
-        raise HTTPException(
-            status_code=413,
-            detail="PDF must be smaller than 10 MB",
-        )
+@app.post("/generate_timetable")
+def generate_timetable(req: TimetableRequest):
+    # 1. Build session nodes
+    sessions = []
+    for cl in req.course_loads:
+        for i in range(cl.credit):
+            sessions.append(
+                {
+                    "id": f"{cl.course}_{cl.batch}_L{i+1}",
+                    "batch": cl.batch,
+                    "course": cl.course,
+                    "prof": cl.prof,
+                }
+            )
 
-    document_id = uuid4().hex
+    G = build_conflict_graph(sessions)
 
-    try:
-        chunks = extract_pdf_chunks(
-            pdf_bytes=pdf_bytes,
-            filename=file.filename,
-            document_id=document_id,
-            chunk_size=450,
-            overlap=75,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
+    # 2. Pre-generate tuple slots (prevents string split bugs)
+    week_slots = [(d, s) for d in req.days for s in req.slots]
 
-    if not chunks:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No selectable text was found. "
-                "This may be a scanned PDF requiring OCR."
-            ),
-        )
+    assignments: dict[str, tuple[str, str]] = {}
+    slot_counts: dict[tuple[str, str], int] = {}
 
-    chunk_dicts = [chunk.to_dict() for chunk in chunks]
+    # 3. Sort nodes by degree descending (Welsh-Powell heuristic)
+    sorted_nodes = sorted(G.nodes(), key=lambda n: G.degree(n), reverse=True)
 
-    DOCUMENTS[document_id] = {
-        "document_id": document_id,
-        "filename": file.filename,
-        "chunk_count": len(chunk_dicts),
+    unassigned_nodes = []
+
+    for node in sorted_nodes:
+        # Collect slots already taken by conflicting neighbors
+        neighbor_slots = {
+            assignments[neigh] for neigh in G.neighbors(node) if neigh in assignments
+        }
+
+        assigned = False
+        for slot_tuple in week_slots:
+            if (
+                slot_tuple not in neighbor_slots
+                and slot_counts.get(slot_tuple, 0) < req.rooms_available
+            ):
+                assignments[node] = slot_tuple
+                slot_counts[slot_tuple] = slot_counts.get(slot_tuple, 0) + 1
+                assigned = True
+                break
+
+        if not assigned:
+            unassigned_nodes.append(node)
+
+    # 4. Initialize nested timetable structure
+    batch_timetables = {
+        batch: {day: {slot: [] for slot in req.slots} for day in req.days}
+        for batch in {cl.batch for cl in req.course_loads}
     }
 
-    CHUNKS.extend(chunk_dicts)
+    # 5. Fill timetable
+    for node, (day, slot) in assignments.items():
+        batch = G.nodes[node]["batch"]
+        batch_timetables[batch][day][slot].append(node)
 
     return {
-        "document_id": document_id,
-        "filename": file.filename,
-        "chunks_created": len(chunk_dicts),
-        "sample_chunk": chunk_dicts[0],
+        "timetable": batch_timetables,
+        "unassigned_count": len(unassigned_nodes),
+        "unassigned_sessions": unassigned_nodes,
     }
